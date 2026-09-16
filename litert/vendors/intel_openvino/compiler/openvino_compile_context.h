@@ -52,7 +52,15 @@ class OpenVinoCompileContext {
   // Enables the NPUW weight-sharing compile knobs on an NPU target so that
   // export_model emits a WEIGHTLESS blob (constants referenced by
   // WeightlessCacheAttribute bin_offset rather than baked in).
-  void ConfigureForNpuWeightSharing();
+  void ConfigureForNpuWeightSharing(bool enable_moe_host_router);
+
+  // Returns whether the MoE host-router NPUW knobs should be enabled for
+  // |model|: false unless enable_moe_gather_ is on AND the model contains a
+  // detectable multi-token-chunk-shaped MoE router (single-token-chunk-shaped
+  // or absent MoE both yield false; no scan runs when enable_moe_gather_ is
+  // off).
+  bool ResolveMoeHostRouterEnable(
+      const std::shared_ptr<ov::Model>& model) const;
 
   // Runs NPU-specific optimization passes on the given OV model.
   void OptimizeModel(const std::shared_ptr<ov::Model>& model) const;

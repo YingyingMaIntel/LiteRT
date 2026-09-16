@@ -20,46 +20,163 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <sstream>
+#include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
-#include "openvino/core/graph_util.hpp"
-#include "openvino/core/model.hpp"
-#include "openvino/op/constant.hpp"
 #include "absl/types/span.h"  // from @com_google_absl
 #include "litert/c/internal/litert_logging.h"
+#include "litert/vendors/intel_openvino/compiler/buffer_id_attribute.h"
 #include "litert/vendors/intel_openvino/compiler/weight_bank.h"
 #include "litert/vendors/intel_openvino/compiler/weightless_caching_attributes.hpp"
+#include "openvino/core/graph_util.hpp"
+#include "openvino/core/model.hpp"
 #include "openvino/core/type.hpp"
+#include "openvino/op/constant.hpp"
 
 namespace litert::openvino {
 
-size_t AliasAndTagSharedConstants(
-    const std::shared_ptr<ov::Model>& ov_model, const WeightBank& weight_bank,
-    const std::map<int32_t, size_t>& pool_offset_of, int partition_idx) {
-  // Collect before mutating: replacing nodes while iterating get_ordered_ops()
-  // is unsafe.
-  std::vector<std::shared_ptr<ov::op::v0::Constant>> candidates;
+namespace {
+
+std::vector<std::pair<std::shared_ptr<ov::op::v0::Constant>, int32_t>>
+ResolveSharedConstants(const std::shared_ptr<ov::Model>& ov_model) {
+  std::vector<std::pair<std::shared_ptr<ov::op::v0::Constant>, int32_t>> resolved;
+  // Collect before any caller mutates the graph: replacing nodes while iterating
+  // get_ordered_ops() is unsafe.
+  for (const auto& node : ov_model->get_ordered_ops()) {
+    auto cnst = ov::as_type_ptr<ov::op::v0::Constant>(node);
+    if (!cnst) continue;
+    const auto& rt = cnst->get_rt_info();
+    const auto it = rt.find(LiteRtBufferIdAttribute::get_type_info_static());
+    if (it == rt.end())
+      continue;  // never harvested: not backed by a shared buffer
+    resolved.emplace_back(cnst,
+                          it->second.as<LiteRtBufferIdAttribute>().buffer_id);
+  }
+  return resolved;
+}
+
+// FNV-1a running hash, so large buffers can be hashed without an intermediate
+// copy into a std::string.
+uint64_t FnvHashBytes(const void* data, size_t size, uint64_t hash) {
+  const auto* bytes = static_cast<const uint8_t*>(data);
+  for (size_t i = 0; i < size; ++i) {
+    hash ^= bytes[i];
+    hash *= /*FNV prime=*/1099511628211ULL;
+  }
+  return hash;
+}
+
+}  // namespace
+
+void HarvestSharedConstants(const std::shared_ptr<ov::Model>& ov_model,
+                            WeightBank& weight_bank, int partition_idx) {
+  size_t by_name = 0;
+  size_t by_hash = 0;
   for (const auto& node : ov_model->get_ordered_ops()) {
     auto cnst = ov::as_type_ptr<ov::op::v0::Constant>(node);
     if (!cnst) continue;
     const size_t elem_size = cnst->get_element_type().size();
     // Skip tiny/shape/scalar constants (fewer than 16 elements) and any type
-    // with unknown element size.
+    // with unknown element size -- never worth pooling.
     if (elem_size == 0 || cnst->get_byte_size() / elem_size < 16) continue;
-    candidates.push_back(cnst);
+
+    auto& rt = cnst->get_rt_info();
+    if (const auto bid =
+            weight_bank.BufferIdOfName(cnst->get_friendly_name())) {
+      // Its name still matches an original LiteRt weight tensor: nothing
+      // touched this Constant since conversion.
+      rt[LiteRtBufferIdAttribute::get_type_info_static()] =
+          LiteRtBufferIdAttribute(*bid);
+      ++by_name;
+      continue;
+    }
+
+    // No name lineage: some optimizer pass synthesized this Constant (e.g.
+    // MoE expert-weight stacking). Its only stable identity is its own byte
+    // content.
+    constexpr uint64_t kFnvOffsetBasis = 14695981039346656037ULL;
+    const uint64_t hash = FnvHashBytes(cnst->get_data_ptr(),
+                                       cnst->get_byte_size(), kFnvOffsetBasis);
+    std::ostringstream key;
+    key << "Derived:" << std::hex << hash;
+    std::vector<uint8_t> bytes(cnst->get_byte_size());
+    std::memcpy(bytes.data(), cnst->get_data_ptr(), bytes.size());
+    const int32_t bid =
+        weight_bank.RegisterOrGetDerivedBuffer(key.str(), std::move(bytes),
+                                              partition_idx);
+    rt[LiteRtBufferIdAttribute::get_type_info_static()] =
+        LiteRtBufferIdAttribute(bid);
+    ++by_hash;
+  }
+  LITERT_LOG(LITERT_INFO,
+             "HarvestSharedConstants: %zu resolved by name, %zu by content "
+             "hash",
+             by_name, by_hash);
+}
+
+std::unordered_set<int32_t> CollectReferencedBufferIds(
+    const std::shared_ptr<ov::Model>& ov_model) {
+  std::unordered_set<int32_t> ids;
+  for (const auto& [cnst, bid] : ResolveSharedConstants(ov_model)) {
+    ids.insert(bid);
+  }
+  return ids;
+}
+
+PoolLayout BuildPool(const std::vector<std::shared_ptr<ov::Model>>& ov_models,
+                     const WeightBank& weight_bank, bool prune_dead) {
+  std::unordered_set<int32_t> live_buffer_ids;
+  if (prune_dead) {
+    for (const auto& m : ov_models) {
+      for (int32_t id : CollectReferencedBufferIds(m)) {
+        live_buffer_ids.insert(id);
+      }
+    }
   }
 
+  // Ordered map keyed by BufferId so the pool is laid out in ascending id
+  // order (matching OpenVinoGlobalGraph::Serialize()).
+  std::map<uint32_t, absl::Span<const uint8_t>> ordered(
+      weight_bank.Buffers().begin(), weight_bank.Buffers().end());
+  PoolLayout layout;
+  size_t running_offset = 0;
+  size_t pruned = 0, pruned_bytes = 0;
+  for (const auto& [buffer_id, bytes] : ordered) {
+    if (prune_dead && !live_buffer_ids.count(static_cast<int32_t>(buffer_id))) {
+      ++pruned;
+      pruned_bytes += bytes.size();
+      continue;
+    }
+    layout.buffers.push_back(
+        {static_cast<int32_t>(buffer_id), running_offset, bytes});
+    layout.pool_offset_of[static_cast<int32_t>(buffer_id)] = running_offset;
+    running_offset += bytes.size();
+  }
+  if (pruned > 0) {
+    LITERT_LOG(LITERT_INFO,
+               "Weight sharing: pruned %zu buffer(s) (%zu bytes) superseded "
+               "by a stacked/derived constant in every partition that "
+               "referenced them",
+               pruned, pruned_bytes);
+  }
+  return layout;
+}
+
+size_t AliasAndTagSharedConstants(
+    const std::shared_ptr<ov::Model>& ov_model, const WeightBank& weight_bank,
+    const std::map<int32_t, size_t>& pool_offset_of, int partition_idx) {
   const auto& buffers = weight_bank.Buffers();
   size_t aliased = 0;
   size_t tagged = 0;
   size_t mismatched = 0;
-  for (const auto& cnst : candidates) {
-    const auto bid = weight_bank.BufferIdOfName(cnst->get_friendly_name());
-    if (!bid) continue;  // OV-synthesized const: not backed by a shared buffer
-    const auto off_it = pool_offset_of.find(*bid);
+  for (const auto& [cnst, bid_val] : ResolveSharedConstants(ov_model)) {
+    const int32_t bid = bid_val;
+    const auto off_it = pool_offset_of.find(bid);
     if (off_it == pool_offset_of.end()) continue;  // not in the shared pool
-    const auto buf_it = buffers.find(*bid);
+    const auto buf_it = buffers.find(bid);
     if (buf_it == buffers.end()) continue;  // defensive: id present in map only
     const absl::Span<const uint8_t> pool_bytes = buf_it->second;
 

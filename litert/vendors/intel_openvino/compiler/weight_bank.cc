@@ -16,10 +16,15 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
+#include "absl/types/span.h"
+#include "litert/c/internal/litert_logging.h"
 #include "litert/compiler/cc/litert_model.h"
 
 namespace litert::openvino {
@@ -56,6 +61,58 @@ size_t WeightBank::TotalBytes() const {
     total += bytes.size();
   }
   return total;
+}
+
+int32_t WeightBank::RegisterOrGetDerivedBuffer(std::string_view key,
+                                               std::vector<uint8_t> bytes,
+                                               int partition_idx) {
+  const std::string key_str(key);
+  if (auto it = derived_key_to_buffer_id_.find(key_str);
+      it != derived_key_to_buffer_id_.end()) {
+    const int owner_partition = derived_key_to_owner_partition_.at(key_str);
+    if (owner_partition == partition_idx) {
+      // Same partition re-hitting a key it already owns: this is two
+      // logically DIFFERENT constants (e.g. two different layers' norm-gain)
+      // that merely hash the same within this one partition, not a
+      // legitimate cross-partition match. Mint an independent BufferId
+      // instead of merging -- and deliberately do NOT record it under |key|,
+      // so it can never be (mis)matched again later either.
+      const int32_t buffer_id =
+          kDerivedBufferIdBase + static_cast<int32_t>(derived_storage_.size());
+      derived_storage_.push_back(std::move(bytes));
+      buffer_bytes_[buffer_id] = absl::MakeConstSpan(derived_storage_.back());
+      LITERT_LOG(LITERT_INFO,
+                 "WeightBank: derived buffer key '%s' seen again within "
+                 "partition %d (its own owner); treating as an independent, "
+                 "unshared buffer instead of merging",
+                 key_str.c_str(), partition_idx);
+      return buffer_id;
+    }
+    // A key match from a DIFFERENT partition is a legitimate cross-partition
+    // match (that's the point of hashing content). This is just a loud
+    // tripwire in case that assumption is ever wrong (hash collision).
+    // AliasAndTagSharedConstants' own byte-compare still protects against a
+    // collision silently corrupting the shared pool, so this cannot itself
+    // cause a correctness bug -- it only makes an otherwise-silent
+    // near-impossible event visible.
+    const absl::Span<const uint8_t> existing = buffer_bytes_.at(it->second);
+    if (existing.size() != bytes.size() ||
+        std::memcmp(existing.data(), bytes.data(), bytes.size()) != 0) {
+      LITERT_LOG(LITERT_ERROR,
+                 "WeightBank: derived buffer key '%s' hash-collided with "
+                 "different content (%zu vs %zu bytes); keeping the first "
+                 "registration",
+                 key_str.c_str(), existing.size(), bytes.size());
+    }
+    return it->second;
+  }
+  const int32_t buffer_id =
+      kDerivedBufferIdBase + static_cast<int32_t>(derived_storage_.size());
+  derived_storage_.push_back(std::move(bytes));
+  buffer_bytes_[buffer_id] = absl::MakeConstSpan(derived_storage_.back());
+  derived_key_to_buffer_id_[key_str] = buffer_id;
+  derived_key_to_owner_partition_[key_str] = partition_idx;
+  return buffer_id;
 }
 
 std::optional<int32_t> WeightBank::BufferIdOfName(

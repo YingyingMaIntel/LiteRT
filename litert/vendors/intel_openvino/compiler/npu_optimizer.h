@@ -15,7 +15,9 @@
 #ifndef LITERT_VENDORS_INTEL_OPENVINO_COMPILER_NPU_OPTIMIZER_H_
 #define LITERT_VENDORS_INTEL_OPENVINO_COMPILER_NPU_OPTIMIZER_H_
 
+#include <cstddef>
 #include <memory>
+#include <optional>
 
 #include "openvino/core/model.hpp"
 #include "openvino/pass/graph_rewrite.hpp"
@@ -84,36 +86,89 @@ class FuseSplitAttentionToSDPA : public ov::pass::MatcherPass {
   explicit FuseSplitAttentionToSDPA(bool pad_kv_to_alignment);
 };
 
-// Rewrites Gemma4's dense Mixture-of-Experts block — where all N experts are
-// computed and non-selected ones are masked to zero — into selective
-// computation of only the K experts chosen by the router's TopK.
+// Gives every consumer of a multi-consumer Constant its own private copy of
+// that Constant, instead of leaving them sharing one node object.
 //
-// Gemma4 (decode) exports each expert as an independent GEGLU branch with its
-// own weights (there is NO batched expert dimension to gather over), the
+// The TFLite frontend (or the model itself) sometimes hands us a graph where
+// two logically-independent tensors that happen to hold identical bytes
+// (e.g. two different transformer layers' RMSNorm gain vectors) have ALREADY
+// been unified into one literal ov::Constant node with multiple consumers --
+// this happens upstream of anything in this compiler, so HarvestSharedConstants
+// (alias_shared_constants.cc) merely inherits it. A single shared node across
+// what should be independent per-layer slots corrupts anything downstream
+// that counts per-layer occurrences to detect a repeated pattern (e.g.
+// NPUW's own repeated-subgraph/fold matcher: one layer's constant appears to
+// "vanish" because its consumer now points at another layer's node).
+//
+// Splitting eagerly, before any other pass runs, guarantees every consumer
+// sees an independent Constant matching the original per-layer semantics.
+// Every multi-consumer Constant is split, regardless of size -- this is
+// unrelated to (and safe alongside) the EXPLICIT cross-partition
+// weight-sharing this compiler adds later via
+// WeightBank/HarvestSharedConstants/AliasAndTagSharedConstants, which never
+// depends on the frontend graph having pre-existing shared node identity.
+class SplitSharedConstants : public ov::pass::ModelPass {
+ public:
+  OPENVINO_RTTI("SplitSharedConstants");
+  explicit SplitSharedConstants();
+  bool run_on_model(const std::shared_ptr<ov::Model>& model) override;
+
+};
+
+// Rewrites Gemma4's dense Mixture-of-Experts block — where all N experts are
+// computed and non-selected ones are masked to zero — into a cheaper form.
+//
+// Gemma4 exports each expert as an independent GEGLU branch with its own
+// weights (there is NO batched expert dimension to gather over), the
 // branches accumulated via a chain of Add and masked by per-expert router
 // scores (Equal(topk_indices, expert_id) -> score, 0 when not selected). Per
-// MoE layer this pass:
-//   1. Locates the router TopK and its N (=128) expert branches; the expert_id
-//      of each branch is read from that branch's Equal constant.
-//   2. Stacks the per-expert weights into grouped constants [N, ...] ordered by
-//      expert_id (i4 dequant scales stacked in the same order).
-//   3. Inserts Gather(grouped_w, topk_indices, axis=0) so only K experts are
-//      computed on-device.
-//   4. Replaces the N-way masked Add chain with a K-way score-weighted sum.
+// MoE layer this pass locates the router TopK and its N (=128) expert
+// branches (expert_id read from each branch's Equal constant), then
+// dispatches by the router's token/chunk batch shape:
+//   - single-token chunk (TopK indices batch statically == 1): only K
+//     experts can be active per call, so per-expert weights are stacked into
+//     grouped [N,...] constants and Gather(grouped_w, topk_indices, axis=0)
+//     selects just those K on-device; the N-way masked Add chain becomes a
+//     K-way score-weighted sum.
+//   - multi-token chunk (batch > 1, or symbolically dynamic): different
+//     tokens in the chunk route to different experts, so there is no single
+//     K-of-N subset to Gather. All N experts are instead densely computed
+//     for the whole chunk (batched MatMul with N as a leading batch axis)
+//     and combined via a [chunk,N] routing-weight matrix built by
+//     scattering each token's top-K weights into a zero background
+//     (ScatterElementsUpdate).
 //
-// Decode/generate only (requires TopK indices batch == 1). Disabled by default;
-// enable via config key "enable_moe_gather" = "true".
+// Disabled by default; enable via config key "enable_moe_gather" = "true"
+// (the same flag gates both the single-token and multi-token-chunk rewrite
+// strategies).
 class MoEGatherRewrite : public ov::pass::ModelPass {
  public:
   OPENVINO_RTTI("MoEGatherRewrite");
   bool run_on_model(const std::shared_ptr<ov::Model>& model) override;
 };
 
+// Scans |model| for Gemma4-style MoE router(s) and reports whether their
+// token/chunk batch shape is a multi-token chunk (true) vs a single-token
+// chunk (false, statically 1), using the same detection this pass relies
+// on. Returns std::nullopt if no MoE router is found, or false if multiple
+// routers disagree on the shape.
+std::optional<bool> DetectMoeIsMultiTokenChunk(
+    const std::shared_ptr<ov::Model>& model);
+
 // Configurable runner for NPU-specific optimization passes.
 // Use the setter APIs to toggle individual optimizations, then call Run() to
 // apply the enabled passes to a model.
 class NpuOptimizer {
  public:
+  // Toggles the SplitSharedConstants pass. Enabled by default: giving every
+  // consumer of a multi-consumer Constant its own copy is always safe and
+  // guards every other pass (including NPUW's own later repeated-subgraph
+  // matching) against pre-existing accidental sharing in the input graph.
+  NpuOptimizer& SetSplitSharedConstants(bool enable) {
+    split_shared_constants_ = enable;
+    return *this;
+  }
+
   // Toggles a ConstantFolding pass. Disabled by default.
   NpuOptimizer& SetConstantFold(bool enable) {
     constant_fold_ = enable;
@@ -160,6 +215,7 @@ class NpuOptimizer {
   void Run(const std::shared_ptr<ov::Model>& model) const;
 
  private:
+  bool split_shared_constants_ = true;
   bool constant_fold_ = false;
   bool eliminate_matmul_fq_ = false;
   bool cast_integer_sign_to_float_ = true;

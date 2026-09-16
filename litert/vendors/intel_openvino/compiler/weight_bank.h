@@ -67,13 +67,58 @@ class WeightBank {
     return buffer_bytes_;
   }
 
+  // Registers a buffer synthesized by a graph rewrite (e.g. MoE expert-weight
+  // stacking) rather than backed by a single LiteRt tensor, keyed by a
+  // caller-chosen identity string (expected to be deterministic: the same
+  // logical stack built independently -- e.g. by two different partitions --
+  // must hash to the same |key|), and the index of the partition the caller
+  // is currently harvesting (see HarvestSharedConstants).
+  //
+  // The first registration for a given |key| stores |bytes|, mints a new
+  // synthetic BufferId (from a reserved range disjoint from LiteRt's own ids,
+  // see kDerivedBufferIdBase), and remembers |partition_idx| as that key's
+  // owning partition. A later call with the same |key| is only treated as a
+  // legitimate cross-partition match -- and returns the existing id -- when
+  // it comes from a DIFFERENT partition than the owner. A later call with the
+  // same |key| from the SAME partition is instead two logically different
+  // constants that merely hash the same within one partition (e.g. two
+  // different layers' norm-gain constants holding equal values): mint an
+  // independent BufferId for it instead of merging, so per-partition node
+  // identity is never collapsed (that would corrupt anything downstream that
+  // counts per-layer slots, e.g. NPUW's repeated-subgraph/fold matcher). That
+  // new id is intentionally NOT reachable by future callers with the same
+  // |key| (it isn't recorded under |key|), so it never accidentally merges
+  // with anything else either.
+  int32_t RegisterOrGetDerivedBuffer(std::string_view key,
+                                     std::vector<uint8_t> bytes,
+                                     int partition_idx);
+
  private:
-  // BufferId -> the buffer's bytes (a view into the model's mmapped weights).
+  // Synthetic BufferIds for RegisterOrGetDerivedBuffer() start here, a value
+  // no real LiteRt-assigned BufferId is expected to reach, so derived buffers
+  // always sort after every genuine one (required by
+  // OpenVinoGlobalGraph::Serialize()'s strictly-ascending-id invariant when a
+  // late-discovered derived buffer is appended to an already-offset-assigned
+  // pool).
+  static constexpr int32_t kDerivedBufferIdBase = 0x40000000;
+
+  // BufferId -> the buffer's bytes (a view into the model's mmapped weights,
+  // or, for derived buffers, into derived_storage_ below).
   std::unordered_map<int32_t, absl::Span<const uint8_t>> buffer_bytes_;
   // Weight tensor name -> its BufferId. Many names may map to one BufferId
   // (tensors that share storage), which is how shared weights resolve to a
   // single pool buffer.
   std::unordered_map<std::string, int32_t> name_to_buffer_id_;
+  // Derived-buffer identity key -> its synthetic BufferId.
+  std::unordered_map<std::string, int32_t> derived_key_to_buffer_id_;
+  // Derived-buffer identity key -> the partition_idx that first registered
+  // it (see RegisterOrGetDerivedBuffer).
+  std::unordered_map<std::string, int> derived_key_to_owner_partition_;
+  // Owns derived buffers' bytes (moving/growing this vector does not
+  // invalidate previously-handed-out spans: growth move-constructs the
+  // std::vector<uint8_t> elements, which only transfers their internal
+  // pointer, never reallocates the underlying heap buffer).
+  std::vector<std::vector<uint8_t>> derived_storage_;
 };
 
 }  // namespace litert::openvino

@@ -183,7 +183,10 @@ litert_lib(
         # WeightlessCacheAttribute on the NPU shared path.
         "weightless_caching_attributes.hpp",
     ],
-    hdrs = ["alias_shared_constants.h"],
+    hdrs = [
+        "alias_shared_constants.h",
+        "buffer_id_attribute.h",
+    ],
     copts = ["-fexceptions"],
     features = ["-use_header_modules"],  # Incompatible with -fexceptions.
     deps = [

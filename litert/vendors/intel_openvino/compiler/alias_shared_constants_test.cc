@@ -37,10 +37,13 @@ namespace openvino {
 namespace {
 
 // Builds a finalized bank from |model| and converts subgraph 0 through the same
-// frontend path the plugin uses, returning the OpenVINO model.
+// frontend path the plugin uses, then harvests shared-buffer identity (see
+// HarvestSharedConstants) the same way the plugin does right after
+// OptimizeModel, returning the OpenVINO model.
 std::shared_ptr<ov::Model> BuildBankAndModel(litert::compiler::Model& model,
                                              const LiteRtCompilerContext* ctx,
-                                             WeightBank& bank) {
+                                             WeightBank& bank,
+                                             int partition_idx = 0) {
   for (size_t s = 0; s < model.NumSubgraphs(); ++s) {
     auto graph = model.Subgraph(s);
     if (graph.HasValue()) bank.AddSubgraph(graph.Value());
@@ -51,7 +54,9 @@ std::shared_ptr<ov::Model> BuildBankAndModel(litert::compiler::Model& model,
   std::shared_ptr<ov::frontend::tensorflow_lite::GraphIterator> delegate =
       std::make_shared<litert::openvino::GraphIteratorDelegate>(
           ctx, &subgraph.Value());
-  return fe->convert(fe->load(delegate));
+  auto ov_model = fe->convert(fe->load(delegate));
+  HarvestSharedConstants(ov_model, bank, partition_idx);
+  return ov_model;
 }
 
 // Lays out the shared pool the same way the plugin does: ascending BufferId
@@ -137,6 +142,47 @@ TEST(AliasSharedConstantsTest, TaggedConstantsCarryPoolOffsets) {
   // Every aliased Constant is tagged; left-baked (byte-mismatched) ones may be
   // tagged too, so tagged >= aliased.
   EXPECT_GE(tagged, aliased);
+}
+
+// BuildPool's liveness check is a UNION across |ov_models|: a buffer kept
+// live by only ONE partition survives pruning exactly like one referenced by
+// every partition. Pool membership must never require being referenced by
+// more than one partition (see ov-weight-sharing-optimize-model plan notes).
+TEST(BuildPoolTest, KeepsBufferReferencedByOnlyOnePartition) {
+  auto cc_model = testing::LoadTestFileModel("multi_subgraph.tflite");
+  const LiteRtCompilerContext* ctx = LrtGetCompilerContext();
+  litert::compiler::Model model(ctx, cc_model.Get());
+  WeightBank bank;
+  auto ov_model = BuildBankAndModel(model, ctx, bank);
+  ASSERT_GT(bank.NumBuffers(), 0u);
+
+  // A second, unrelated (empty) model that references none of |bank|'s
+  // buffers -- simulates a partition that never touches this weight.
+  auto empty_model =
+      std::make_shared<ov::Model>(ov::ResultVector{}, ov::ParameterVector{});
+
+  const auto layout =
+      BuildPool({ov_model, empty_model}, bank, /*prune_dead=*/true);
+  EXPECT_EQ(layout.buffers.size(), bank.NumBuffers());
+}
+
+// With pruning disabled (the GPU path), every recorded buffer is kept even
+// when NO model references it.
+TEST(BuildPoolTest, KeepsEverythingWhenPruningDisabled) {
+  auto cc_model = testing::LoadTestFileModel("multi_subgraph.tflite");
+  const LiteRtCompilerContext* ctx = LrtGetCompilerContext();
+  litert::compiler::Model model(ctx, cc_model.Get());
+  WeightBank bank;
+  for (size_t s = 0; s < model.NumSubgraphs(); ++s) {
+    auto graph = model.Subgraph(s);
+    if (graph.HasValue()) bank.AddSubgraph(graph.Value());
+  }
+  ASSERT_GT(bank.NumBuffers(), 0u);
+
+  auto empty_model =
+      std::make_shared<ov::Model>(ov::ResultVector{}, ov::ParameterVector{});
+  const auto layout = BuildPool({empty_model}, bank, /*prune_dead=*/false);
+  EXPECT_EQ(layout.buffers.size(), bank.NumBuffers());
 }
 
 }  // namespace

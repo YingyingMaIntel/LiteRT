@@ -17,8 +17,7 @@
 #include <memory>
 #include <string>
 
-#include "openvino/core/model.hpp"
-#include "openvino/runtime/properties.hpp"
+#include "absl/strings/numbers.h"
 #include "litert/c/internal/litert_logging.h"
 #include "litert/c/litert_common.h"
 #include "litert/c/options/litert_intel_openvino_options.h"
@@ -26,6 +25,8 @@
 #include "litert/cc/options/litert_intel_openvino_options.h"
 #include "litert/vendors/intel_openvino/compiler/npu_optimizer.h"
 #include "litert/vendors/intel_openvino/compiler/openvino_soc_config.h"
+#include "openvino/core/model.hpp"
+#include "openvino/runtime/properties.hpp"
 
 namespace litert {
 namespace openvino {
@@ -169,17 +170,46 @@ LiteRtStatus OpenVinoCompileContext::ConfigureForSoc(const char* soc_model) {
   return kLiteRtStatusOk;
 }
 
-void OpenVinoCompileContext::ConfigureForNpuWeightSharing() {
+void OpenVinoCompileContext::ConfigureForNpuWeightSharing(
+    bool moe_host_router_enabled) {
   if (device_ != "NPU") return;
   // NPUW private properties, set by literal key because
   // npuw_private_properties.hpp is not shipped in the runtime SDK.
   configs_map_["NPU_USE_NPUW"] = "YES";
   configs_map_["NPUW_DEVICES"] = "NPU";
   configs_map_["NPUW_WEIGHTS_BANK"] = "shared";
-  configs_map_["NPUW_CWAI"] = "YES";
   configs_map_["NPUW_FUNCALL_FOR_ALL"] = "YES";
+
+  if (moe_host_router_enabled) {
+    configs_map_["NPUW_ONLINE_PIPELINE"] = "REP";
+    configs_map_["NPUW_UNFOLD_IREQS"] = "NO";
+    configs_map_["NPUW_ONLINE_ISOLATE"] = "ATTN,MOE";
+    configs_map_["NPUW_MOE_TOKEN_CHUNK_SIZE"] = 0;
+    configs_map_["NPUW_ONLINE_KEEP_BLOCK_SIZE"] = "4";
+
+    configs_map_["NPUW_FOLD"] = "YES";
+    configs_map_["NPUW_ONLINE_KEEP_BLOCKS"] = "3";
+
+    // configs_map_["NPUW_CWAI"] = "YES";
+    // configs_map_["NPUW_FOLD_ONLY"] = "expert,router,downstream";
+
+    // dump subgraphs
+    configs_map_["NPUW_DUMP_SUBS"] = "MIN";
+    configs_map_["NPUW_DUMP_SUBS_DIR"] = "./npuw_dumps";
+  } else {
+    configs_map_["NPUW_ONLINE_PIPELINE"] = "NONE";
+    configs_map_["NPUW_CWAI"] = "YES";
+  }
+
   LITERT_LOG(LITERT_INFO,
              "NPU weight sharing: enabled NPUW/CWAI weightless compile knobs");
+}
+
+bool OpenVinoCompileContext::ResolveMoeHostRouterEnable(
+    const std::shared_ptr<ov::Model>& model) const {
+  if (!enable_moe_gather_) return false;
+  auto is_multi_token_chunk = DetectMoeIsMultiTokenChunk(model);
+  return is_multi_token_chunk.has_value() && *is_multi_token_chunk;
 }
 
 void OpenVinoCompileContext::OptimizeModel(

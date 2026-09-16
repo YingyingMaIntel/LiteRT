@@ -37,6 +37,7 @@
 #include "openvino/core/type.hpp"
 #include "openvino/core/type/element_type.hpp"
 #include "openvino/op/add.hpp"
+#include "openvino/op/broadcast.hpp"
 #include "openvino/op/concat.hpp"
 #include "openvino/op/constant.hpp"
 #include "openvino/op/convert.hpp"
@@ -50,11 +51,14 @@
 #include "openvino/op/reduce_sum.hpp"
 #include "openvino/op/reshape.hpp"
 #include "openvino/op/scaled_dot_product_attention.hpp"
+#include "openvino/op/scatter_elements_update.hpp"
+#include "openvino/op/shape_of.hpp"
 #include "openvino/op/sign.hpp"
 #include "openvino/op/slice.hpp"
 #include "openvino/op/softmax.hpp"
 #include "openvino/op/squeeze.hpp"
 #include "openvino/op/strided_slice.hpp"
+#include "openvino/op/tile.hpp"
 #include "openvino/op/topk.hpp"
 #include "openvino/op/transpose.hpp"
 #include "openvino/op/unsqueeze.hpp"
@@ -508,6 +512,10 @@ struct MoELayer {
   ov::Output<ov::Node> topk_indices;  // TopK output(1)
   int64_t k = 0;                      // active experts (top-K)
   size_t num_experts = 0;             // total experts (=128 for Gemma4-26B)
+  // true when the router's token/chunk batch dim is a multi-token chunk
+  // (batch > 1, or symbolically dynamic); false when it is statically
+  // known to be a single-token chunk (batch == 1).
+  bool is_multi_token_chunk = false;
   std::vector<ExpertBranch> experts;  // filled + sorted by expert_id
   // The router's per-position routing-weight vector [1,K] that dense multiplies
   // each expert by (shared across all experts). Gemma4's router is
@@ -736,6 +744,45 @@ std::shared_ptr<ov::op::v0::Constant> StackConstantsRaw(
   return std::make_shared<ov::op::v0::Constant>(type, new_shape, buffer.data());
 }
 
+// Splits a single Constant of shape [rows, ...] into two Constants
+// [0:split_at, ...] and [split_at:rows, ...] via a raw memcpy of the
+// underlying byte buffer (no Slice/decompression op involved) -- the same
+// byte-alignment guarantee StackConstantsRaw relies on (each row is a whole
+// number of bytes) makes splitting on a row boundary safe for sub-byte
+// packed types (u4/i4) too. Used to turn one expert's fused gate+up
+// projection weight/scale into independent gate and up buffers before they
+// are stacked across experts, instead of stacking the fused buffer and
+// slicing the MatMul's output.
+// Returns {nullptr, nullptr} if |c| isn't a plain Constant, has fewer than
+// one dimension, or split_at is out of [0, rows] range.
+std::pair<std::shared_ptr<ov::op::v0::Constant>,
+          std::shared_ptr<ov::op::v0::Constant>>
+SplitConstantRowsRaw(const std::shared_ptr<ov::op::v0::Constant>& c,
+                     size_t split_at) {
+  if (!c) return {nullptr, nullptr};
+  const ov::Shape& shape = c->get_shape();
+  if (shape.empty() || split_at > shape[0]) return {nullptr, nullptr};
+
+  const ov::element::Type type = c->get_element_type();
+  const size_t rows = shape[0];
+  const size_t second_rows = rows - split_at;
+  const size_t elems_per_row = ov::shape_size(shape) / (rows == 0 ? 1 : rows);
+  const size_t bits = type.bitwidth();
+  if ((elems_per_row * bits) % 8 != 0) return {nullptr, nullptr};
+  const size_t row_bytes = (elems_per_row * bits) / 8;
+
+  ov::Shape first_shape = shape;
+  first_shape[0] = split_at;
+  ov::Shape second_shape = shape;
+  second_shape[0] = second_rows;
+
+  const auto* data = static_cast<const uint8_t*>(c->get_data_ptr());
+  auto first = std::make_shared<ov::op::v0::Constant>(type, first_shape, data);
+  auto second = std::make_shared<ov::op::v0::Constant>(
+      type, second_shape, data + split_at * row_bytes);
+  return {first, second};
+}
+
 // Expands per-expert scalar indices |idx| ([K], i64/i32) into flat row
 // indices selecting whole rows out of a [N*rows, cols] flattened table
 // (expert e's rows land at [e*rows, (e+1)*rows)).
@@ -798,51 +845,45 @@ ov::Output<ov::Node> GatherPackedRowsViaFlatten(
       ->output(0);
 }
 
-// Rewrites one MoE layer into gather-K form:
-//   1. Validate that ALL experts strictly share uniform quantization patterns
-//      and byte-aligned plain Constant weights/scales.
-//   2. Stack per-expert weights (sorted by expert_id) into grouped [N,...]
-//      constants and Gather the K selected by the router.
-//   3. Recompute the up-proj with the gathered weights (batched MatMul of
-//      hidden [1,H] against gathered_up_weights [K,gate_up,H] -> [K,1,gate_up]
-//      -> [K,gate_up]), then rebuild the GEGLU EXPLICITLY (feature-axis slices
-//      + Gelu-TANH) and the down-proj as a batched MatMul. The GEGLU is
-//      rebuilt rather than cloned because the model's GEGLU Slice carries a
-//      batch-1-baked size that would truncate the K experts back to 1.
-//   4. Weight each of the K down-proj outputs by layer.router_weights (the
-//      dense graph's actual per-position routing weight [1,K], divide-by-sum
-//      renormalized -- NOT the raw TopK value) and ReduceSum over the K axis.
-//   5. Replace the final node of the 128-way Add accumulation chain with that
-//   sum.
-// Returns false (leaving the graph untouched) if any expert lacks valid packed
-// weights, shapes/types are non-uniform, or the accumulation chain shape fails.
-bool RegroupAndRewrite(const MoELayer& layer) {
+// Output of ValidateMoeLayerCommon: the pieces both RegroupAndRewrite
+// (single-token/gather) and RegroupAndRewriteChunk (multi-token chunk) need
+// after the shared validation passes.
+struct MoeLayerValidation {
+  std::shared_ptr<ov::Node> final_add;  // root of the 128-way Add chain
+  int64_t half = 0;                     // fused gate+up width / 2
+};
+
+// Validation shared by both rewrite strategies: contiguous expert_id
+// 0..N-1 (grouped weight tables are stacked/indexed in that order), a
+// static/even fused gate+up width (so the GEGLU can be re-sliced), uniform
+// i4/u4 dequant patterns across all experts, and exactly one Add-chain root.
+// |pass_tag| is only used to disambiguate log lines between the two callers.
+bool ValidateMoeLayerCommon(const MoELayer& layer, const char* pass_tag,
+                            MoeLayerValidation& out) {
   const std::string name = layer.topk->get_friendly_name();
-  if (layer.experts.size() != layer.num_experts || layer.k <= 0) {
+  if (layer.experts.size() != layer.num_experts) {
     LITERT_LOG(LITERT_INFO,
-               "[MoEGather] rewrite[%s]: abort: experts.size()=%zu "
-               "num_experts=%zu k=%lld",
-               name.c_str(), layer.experts.size(), layer.num_experts,
-               static_cast<long long>(layer.k));
+               "[%s] rewrite[%s]: abort: experts.size()=%zu num_experts=%zu",
+               pass_tag, name.c_str(), layer.experts.size(), layer.num_experts);
     return false;
   }
   if (!layer.router_weights.get_node_shared_ptr()) {
     LITERT_LOG(LITERT_INFO,
-               "[MoEGather] rewrite[%s]: abort: router weight vector not "
-               "captured (unexpected router topology)",
-               name.c_str());
+               "[%s] rewrite[%s]: abort: router weight vector not captured "
+               "(unexpected router topology)",
+               pass_tag, name.c_str());
     return false;
   }
-  // Gather indexes the grouped weight table by expert_id value while rows are
-  // stacked in sorted-expert_id order; only correct when the sorted expert_ids
-  // are exactly 0..N-1 (contiguous). Confirmed for Gemma4 (branch p tests
-  // topk==p and uses weight_p); bail to dense otherwise.
+  // Gather/stacking indexes the grouped weight table by expert_id value
+  // while rows are stacked in sorted-expert_id order; only correct when the
+  // sorted expert_ids are exactly 0..N-1 (contiguous). Confirmed for Gemma4
+  // (branch p tests topk==p and uses weight_p); bail to dense otherwise.
   for (size_t i = 0; i < layer.experts.size(); ++i) {
     if (layer.experts[i].expert_id != static_cast<int64_t>(i)) {
       LITERT_LOG(LITERT_INFO,
-                 "[MoEGather] rewrite[%s]: abort: expert_ids not contiguous "
-                 "0..N-1 (experts[%zu].expert_id=%lld)",
-                 name.c_str(), i,
+                 "[%s] rewrite[%s]: abort: expert_ids not contiguous 0..N-1 "
+                 "(experts[%zu].expert_id=%lld)",
+                 pass_tag, name.c_str(), i,
                  static_cast<long long>(layer.experts[i].expert_id));
       return false;
     }
@@ -856,11 +897,29 @@ bool RegroupAndRewrite(const MoELayer& layer) {
   if (up_rank < 1 || !up_ps[up_rank - 1].is_static() ||
       up_ps[up_rank - 1].get_length() % 2 != 0) {
     LITERT_LOG(LITERT_INFO,
-               "[MoEGather] rewrite[%s]: abort: gate+up width not static/even",
-               name.c_str());
+               "[%s] rewrite[%s]: abort: gate+up width not static/even",
+               pass_tag, name.c_str());
     return false;
   }
-  const int64_t half = up_ps[up_rank - 1].get_length() / 2;
+  out.half = up_ps[up_rank - 1].get_length() / 2;
+
+  const auto& ref = layer.experts.front();
+  for (const auto& e : layer.experts) {
+    if (!e.w_up_has_dequant || !e.w_down_has_dequant) {
+      LITERT_LOG(LITERT_INFO,
+                 "[%s] rewrite[%s]: abort: missing i4/u4 packed pattern for "
+                 "some experts.",
+                 pass_tag, name.c_str());
+      return false;
+    }
+    if (e.w_up_dequant_type != ref.w_up_dequant_type ||
+        e.w_down_dequant_type != ref.w_down_dequant_type) {
+      LITERT_LOG(LITERT_INFO,
+                 "[%s] rewrite[%s]: abort: mixed dequant types among experts.",
+                 pass_tag, name.c_str());
+      return false;
+    }
+  }
 
   std::vector<ov::Node*> chain_adds;
   chain_adds.reserve(layer.experts.size());
@@ -886,11 +945,47 @@ bool RegroupAndRewrite(const MoELayer& layer) {
   }
   if (root_count != 1 || !final_add) {
     LITERT_LOG(LITERT_INFO,
-               "[MoEGather] rewrite[%s]: abort: found %d chain roots "
-               "(expected exactly 1)",
-               name.c_str(), root_count);
+               "[%s] rewrite[%s]: abort: found %d chain roots (expected "
+               "exactly 1)",
+               pass_tag, name.c_str(), root_count);
     return false;
   }
+  out.final_add = final_add;
+  return true;
+}
+
+// Rewrites one single-token-chunk-shaped (router batch == 1) MoE layer into
+// gather-K form:
+//   1. Validate via ValidateMoeLayerCommon.
+//   2. Split each expert's fused gate+up weight/scale into independent gate
+//      and up halves (SplitConstantRowsRaw), then stack each half across
+//      experts separately (sorted by expert_id) into grouped [N,...]
+//      constants and Gather the K selected by the router, independently for
+//      the gate half and the up half.
+//   3. Recompute the projections with the gathered weights: two independent
+//      batched MatMuls (hidden [1,H] against each of gathered_gate_weights
+//      and gathered_up_weights, each [K,half,H]) -> [K,1,half] -> [K,half],
+//      then Gelu-TANH the gate half and Multiply by the up half directly (no
+//      Slice needed -- each MatMul already produces exactly its half of the
+//      GEGLU width) and the down-proj as a batched MatMul.
+//   4. Weight each of the K down-proj outputs by layer.router_weights (the
+//      dense graph's actual per-position routing weight [1,K], divide-by-sum
+//      renormalized -- NOT the raw TopK value) and ReduceSum over the K axis.
+//   5. Replace the final node of the 128-way Add accumulation chain with that
+//   sum.
+// Returns false (leaving the graph untouched) if any expert lacks valid packed
+// weights, shapes/types are non-uniform, or the accumulation chain shape fails.
+bool RegroupAndRewrite(const MoELayer& layer) {
+  const std::string name = layer.topk->get_friendly_name();
+  if (layer.k <= 0) {
+    LITERT_LOG(LITERT_INFO, "[MoEGather] rewrite[%s]: abort: k=%lld",
+               name.c_str(), static_cast<long long>(layer.k));
+    return false;
+  }
+  MoeLayerValidation validation;
+  if (!ValidateMoeLayerCommon(layer, "MoEGather", validation)) return false;
+  const int64_t half = validation.half;
+  const std::shared_ptr<ov::Node> final_add = validation.final_add;
 
   auto k_shape =
       ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {layer.k});
@@ -898,36 +993,19 @@ bool RegroupAndRewrite(const MoELayer& layer) {
       std::make_shared<ov::op::v1::Reshape>(layer.topk_indices, k_shape, false);
   auto axis0 = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {0});
 
-  // Ensure ALL experts share the exact same quantization standard.
+  // Dequant-type uniformity across experts already verified above.
   auto& ref = layer.experts.front();
-  for (const auto& e : layer.experts) {
-    if (!e.w_up_has_dequant || !e.w_down_has_dequant) {
-      LITERT_LOG(LITERT_INFO,
-                 "[MoEGather] rewrite[%s]: abort: missing i4/u4 packed "
-                 "pattern for some experts.",
-                 name.c_str());
-      return false;
-    }
-    if (e.w_up_dequant_type != ref.w_up_dequant_type ||
-        e.w_down_dequant_type != ref.w_down_dequant_type) {
-      LITERT_LOG(
-          LITERT_INFO,
-          "[MoEGather] rewrite[%s]: abort: mixed dequant types among experts.",
-          name.c_str());
-      return false;
-    }
-  }
 
-  // Helper lambda: Extracts constants, stacks them, and builds the Gather
-  // subgraph. Returns an empty Output if strict stacking fails.
-  auto build_gathered_weights = [&](bool is_up_proj) -> ov::Output<ov::Node> {
+  // Helper lambda: extracts the down-proj constants, stacks them, and builds
+  // the Gather subgraph. Returns an empty Output if strict stacking fails.
+  auto build_gathered_down_weights = [&]() -> ov::Output<ov::Node> {
     ov::OutputVector packed, scales;
     packed.reserve(layer.experts.size());
     scales.reserve(layer.experts.size());
 
     for (const auto& e : layer.experts) {
-      packed.push_back(is_up_proj ? e.w_up_packed : e.w_down_packed);
-      scales.push_back(is_up_proj ? e.w_up_scale : e.w_down_scale);
+      packed.push_back(e.w_down_packed);
+      scales.push_back(e.w_down_scale);
     }
     auto grouped_packed = StackConstantsRaw(packed);
     auto grouped_scale = StackConstantsRaw(scales);
@@ -935,13 +1013,11 @@ bool RegroupAndRewrite(const MoELayer& layer) {
     // Strict Stacking check: abort if not uniform constants or byte-aligned.
     if (!grouped_packed || !grouped_scale) {
       LITERT_LOG(LITERT_INFO,
-                 "[MoEGather] rewrite[%s]: abort: %s weights or scales are not "
-                 "uniform plain constants or not byte-aligned.",
-                 name.c_str(), is_up_proj ? "up" : "down");
+                 "[MoEGather] rewrite[%s]: abort: down weights or scales are "
+                 "not uniform plain constants or not byte-aligned.",
+                 name.c_str());
       return ov::Output<ov::Node>();  // Return empty output to signal failure
     }
-    auto dequant_type =
-        is_up_proj ? ref.w_up_dequant_type : ref.w_down_dequant_type;
     // Flattening to 2-D before Gather gets better hardware utilization on the
     // NPU backend than a direct 3-D batched gather (see
     // GatherPackedRowsViaFlatten). The (already f32) scale Gathers directly in
@@ -950,50 +1026,94 @@ bool RegroupAndRewrite(const MoELayer& layer) {
         GatherPackedRowsViaFlatten(grouped_packed, idx, layer.k);
     auto g_scale =
         std::make_shared<ov::op::v8::Gather>(grouped_scale, idx, axis0);
-    auto g_dequant =
-        std::make_shared<ov::op::v0::Convert>(g_packed, dequant_type);
+    auto g_dequant = std::make_shared<ov::op::v0::Convert>(
+        g_packed, ref.w_down_dequant_type);
 
     return std::make_shared<ov::op::v1::Multiply>(g_dequant, g_scale);
   };
 
+  // Helper lambda: splits every expert's fused gate+up weight/scale into
+  // independent gate and up halves (SplitConstantRowsRaw), stacks each half
+  // across experts separately, and Gathers each independently. Returns a
+  // pair of empty Outputs if strict stacking fails.
+  auto build_gathered_gate_up_weights =
+      [&]() -> std::pair<ov::Output<ov::Node>, ov::Output<ov::Node>> {
+    ov::OutputVector gate_packed, up_packed, gate_scale, up_scale;
+    gate_packed.reserve(layer.experts.size());
+    up_packed.reserve(layer.experts.size());
+    gate_scale.reserve(layer.experts.size());
+    up_scale.reserve(layer.experts.size());
+
+    for (const auto& e : layer.experts) {
+      auto packed_c = std::dynamic_pointer_cast<ov::op::v0::Constant>(
+          e.w_up_packed.get_node_shared_ptr());
+      auto scale_c = std::dynamic_pointer_cast<ov::op::v0::Constant>(
+          e.w_up_scale.get_node_shared_ptr());
+      auto [g_packed, u_packed] =
+          SplitConstantRowsRaw(packed_c, static_cast<size_t>(half));
+      auto [g_scale, u_scale] =
+          SplitConstantRowsRaw(scale_c, static_cast<size_t>(half));
+      if (!g_packed || !u_packed || !g_scale || !u_scale) {
+        LITERT_LOG(LITERT_INFO,
+                   "[MoEGather] rewrite[%s]: abort: failed to split fused "
+                   "gate+up weight/scale into halves.",
+                   name.c_str());
+        return {ov::Output<ov::Node>(), ov::Output<ov::Node>()};
+      }
+      gate_packed.push_back(g_packed);
+      up_packed.push_back(u_packed);
+      gate_scale.push_back(g_scale);
+      up_scale.push_back(u_scale);
+    }
+
+    auto build_one =
+        [&](const ov::OutputVector& packed,
+            const ov::OutputVector& scale) -> ov::Output<ov::Node> {
+      auto grouped_packed = StackConstantsRaw(packed);
+      auto grouped_scale = StackConstantsRaw(scale);
+      if (!grouped_packed || !grouped_scale) {
+        LITERT_LOG(LITERT_INFO,
+                   "[MoEGather] rewrite[%s]: abort: split gate/up weights or "
+                   "scales are not uniform plain constants or not "
+                   "byte-aligned.",
+                   name.c_str());
+        return ov::Output<ov::Node>();
+      }
+      ov::Output<ov::Node> g_packed =
+          GatherPackedRowsViaFlatten(grouped_packed, idx, layer.k);
+      auto g_scale =
+          std::make_shared<ov::op::v8::Gather>(grouped_scale, idx, axis0);
+      auto g_dequant = std::make_shared<ov::op::v0::Convert>(
+          g_packed, ref.w_up_dequant_type);
+      return std::make_shared<ov::op::v1::Multiply>(g_dequant, g_scale);
+    };
+
+    return {build_one(gate_packed, gate_scale), build_one(up_packed, up_scale)};
+  };
+
   // Build the strict gather subgraphs
-  ov::Output<ov::Node> gathered_up_weights = build_gathered_weights(true);
-  if (!gathered_up_weights.get_node_shared_ptr()) return false;
-  ov::Output<ov::Node> gathered_down_weights = build_gathered_weights(false);
+  auto [gathered_gate_weights, gathered_up_weights] =
+      build_gathered_gate_up_weights();
+  if (!gathered_gate_weights.get_node_shared_ptr() ||
+      !gathered_up_weights.get_node_shared_ptr()) {
+    return false;
+  }
+  ov::Output<ov::Node> gathered_down_weights = build_gathered_down_weights();
   if (!gathered_down_weights.get_node_shared_ptr()) return false;
 
-  // Batched up/gate projection. Keep hidden as [1,H] (do NOT squeeze to 1-D --
-  // 1-D MatMul lowers poorly on the NPU). MatMul([1,H],
-  // gathered_up_weights[K,gate_up,H], transpose_b) broadcasts to [K,1,gate_up];
-  // squeeze the size-1 middle dim.
-  auto new_up_bcast = ref.up_matmul->clone_with_new_inputs(
-      {ref.up_matmul->input_value(0), gathered_up_weights});
+  // Independent batched gate/up projections. Keep hidden as [1,H] (do NOT
+  // squeeze to 1-D -- 1-D MatMul lowers poorly on the NPU). Each
+  // MatMul([1,H], gathered_*_weights[K,half,H], transpose_b) broadcasts to
+  // [K,1,half]; squeeze the size-1 middle dim.
   auto sq_axis1 =
       ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {1});
-  auto up_2d = std::make_shared<ov::op::v0::Squeeze>(new_up_bcast, sq_axis1);
+  auto new_gate_bcast = ref.up_matmul->clone_with_new_inputs(
+      {ref.up_matmul->input_value(0), gathered_gate_weights});
+  auto gate = std::make_shared<ov::op::v0::Squeeze>(new_gate_bcast, sq_axis1);
+  auto new_up_bcast = ref.up_matmul->clone_with_new_inputs(
+      {ref.up_matmul->input_value(0), gathered_up_weights});
+  auto up_half = std::make_shared<ov::op::v0::Squeeze>(new_up_bcast, sq_axis1);
 
-  // Reproduce the original GEGLU faithfully: two Slice ops (one per consumer
-  // chain -- gate half and up half), a Gelu, and a Multiply. The ONLY deviation
-  // forced by the weights-gather is the slice axis: the original Slice carries
-  // a batch-1-baked size ([1,half]) that would truncate our K experts (axis 0)
-  // back to 1, so we slice only the feature axis (axes=[1]) and leave axis 0
-  // (the K experts) untouched. gate=[:,0:half] (Gelu-TANH), up=[:,half:2*half].
-  auto slice_step =
-      ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {1});
-  auto slice_axis =
-      ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {1});
-  auto gate_start =
-      ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {0});
-  auto gate_stop =
-      ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {half});
-  auto gate = std::make_shared<ov::op::v8::Slice>(up_2d, gate_start, gate_stop,
-                                                  slice_step, slice_axis);
-  auto up_start =
-      ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {half});
-  auto up_stop =
-      ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {2 * half});
-  auto up_half = std::make_shared<ov::op::v8::Slice>(up_2d, up_start, up_stop,
-                                                     slice_step, slice_axis);
   auto gate_act = std::make_shared<ov::op::v7::Gelu>(
       gate, ov::op::GeluApproximationMode::TANH);
   auto geglu = std::make_shared<ov::op::v1::Multiply>(gate_act, up_half);
@@ -1026,16 +1146,231 @@ bool RegroupAndRewrite(const MoELayer& layer) {
     return false;
   }
   summed->set_friendly_name(final_add->get_friendly_name());
-  ov::copy_runtime_info(
-      final_add, {new_up_bcast, up_2d, gate, up_half, gate_act, geglu, geglu_3d,
-                  new_down, gathered_up_weights.get_node_shared_ptr(),
-                  gathered_down_weights.get_node_shared_ptr(), weights,
-                  weights_b, weighted, summed});
+  ov::copy_runtime_info(final_add, {new_gate_bcast, gate, new_up_bcast, up_half,
+                                    gate_act, geglu, geglu_3d, new_down,
+                                    gathered_gate_weights.get_node_shared_ptr(),
+                                    gathered_up_weights.get_node_shared_ptr(),
+                                    gathered_down_weights.get_node_shared_ptr(),
+                                    weights, weights_b, weighted, summed});
   ov::replace_node(final_add, summed);
-  LITERT_LOG(LITERT_INFO,
+  LITERT_LOG(LITERT_DEBUG,
              "[MoEGather] rewrite[%s]: OK, replaced chain root '%s' with "
              "gather-K subgraph",
              name.c_str(), summed->get_friendly_name().c_str());
+  return true;
+}
+
+// Rewrites one multi-token-chunk-shaped (router batch > 1, or symbolically
+// dynamic) MoE layer. Unlike a single-token chunk, a multi-token call routes
+// DIFFERENT experts per token, so there is no single K-of-N subset to
+// Gather; instead ALL N experts are densely computed for the whole chunk and
+// combined through a per-token routing-weight matrix:
+//   1. Validate via ValidateMoeLayerCommon.
+//   2. Split each expert's fused gate+up weight/scale into independent gate
+//      and up halves (SplitConstantRowsRaw), then stack ALL experts' gate
+//      halves and ALL experts' up halves separately (sorted by expert_id)
+//      into two grouped [N,...] constants -- no Gather/K-selection.
+//   3. Two independent batched MatMuls of hidden [chunk,H] against the
+//      stacked gate-weights and stacked up-weights (each [N,half,H])
+//      broadcast to [N,chunk,half] directly (OV MatMul numpy-style
+//      broadcasts leading batch dims when ranks differ; no Slice needed --
+//      each MatMul already produces exactly its half of the GEGLU width);
+//      Gelu-TANH the gate result and Multiply by the up result, then the
+//      down-proj as a batched MatMul -> [N,chunk,H].
+//   4. Build a [chunk,N] routing-weight matrix by scattering each token's
+//      renormalized top-K weights (layer.router_weights) into an all-zero
+//      background at its selected expert columns
+//      (ScatterElementsUpdate(topk_indices, router_weights, axis=1)), then
+//      align it to [N,chunk,1] and weight+ReduceSum the N expert outputs.
+//   5. Replace the final node of the 128-way Add accumulation chain with that
+//      sum.
+// The chunk (token-batch) dimension is never assumed static -- it is read
+// from ShapeOf(topk_indices) at graph-build time, so this works whether the
+// exported chunk size is 128, 1024, or symbolically dynamic. Only the expert
+// count N (layer.num_experts) must be statically known.
+bool RegroupAndRewriteChunk(const MoELayer& layer) {
+  const std::string name = layer.topk->get_friendly_name();
+  MoeLayerValidation validation;
+  if (!ValidateMoeLayerCommon(layer, "MoEChunk", validation)) {
+    return false;
+  }
+  const int64_t half = validation.half;
+  const std::shared_ptr<ov::Node> final_add = validation.final_add;
+  const int64_t num_experts = static_cast<int64_t>(layer.num_experts);
+
+  const auto& ref = layer.experts.front();
+  auto axis0 = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {0});
+
+  // Stacks ALL experts' down-proj weights (no Gather -- every expert is
+  // computed for every token). Returns an empty Output if strict stacking
+  // fails.
+  auto stack_all_down_weights = [&]() -> ov::Output<ov::Node> {
+    ov::OutputVector packed, scales;
+    packed.reserve(layer.experts.size());
+    scales.reserve(layer.experts.size());
+    for (const auto& e : layer.experts) {
+      packed.push_back(e.w_down_packed);
+      scales.push_back(e.w_down_scale);
+    }
+    auto grouped_packed = StackConstantsRaw(packed);
+    auto grouped_scale = StackConstantsRaw(scales);
+    if (!grouped_packed || !grouped_scale) {
+      LITERT_LOG(LITERT_INFO,
+                 "[MoEChunk] rewrite[%s]: abort: down weights or scales "
+                 "are not uniform plain constants or not byte-aligned.",
+                 name.c_str());
+      return ov::Output<ov::Node>();
+    }
+    auto dequant = std::make_shared<ov::op::v0::Convert>(
+        grouped_packed, ref.w_down_dequant_type);
+    return std::make_shared<ov::op::v1::Multiply>(dequant, grouped_scale);
+  };
+
+  // Splits every expert's fused gate+up weight/scale into independent gate
+  // and up halves (SplitConstantRowsRaw), then stacks ALL experts' gate
+  // halves into one grouped constant and ALL experts' up halves into
+  // another (no Gather -- every expert is computed for every token).
+  // Returns a pair of empty Outputs if splitting/stacking fails.
+  auto stack_all_gate_up_weights =
+      [&]() -> std::pair<ov::Output<ov::Node>, ov::Output<ov::Node>> {
+    ov::OutputVector gate_packed, up_packed, gate_scale, up_scale;
+    gate_packed.reserve(layer.experts.size());
+    up_packed.reserve(layer.experts.size());
+    gate_scale.reserve(layer.experts.size());
+    up_scale.reserve(layer.experts.size());
+
+    for (const auto& e : layer.experts) {
+      auto packed_c = std::dynamic_pointer_cast<ov::op::v0::Constant>(
+          e.w_up_packed.get_node_shared_ptr());
+      auto scale_c = std::dynamic_pointer_cast<ov::op::v0::Constant>(
+          e.w_up_scale.get_node_shared_ptr());
+      auto [g_packed, u_packed] =
+          SplitConstantRowsRaw(packed_c, static_cast<size_t>(half));
+      auto [g_scale, u_scale] =
+          SplitConstantRowsRaw(scale_c, static_cast<size_t>(half));
+      if (!g_packed || !u_packed || !g_scale || !u_scale) {
+        LITERT_LOG(LITERT_INFO,
+                   "[MoEChunk] rewrite[%s]: abort: failed to split fused "
+                   "gate+up weight/scale into halves.",
+                   name.c_str());
+        return {ov::Output<ov::Node>(), ov::Output<ov::Node>()};
+      }
+      gate_packed.push_back(g_packed);
+      up_packed.push_back(u_packed);
+      gate_scale.push_back(g_scale);
+      up_scale.push_back(u_scale);
+    }
+
+    auto build_one =
+        [&](const ov::OutputVector& packed,
+            const ov::OutputVector& scale) -> ov::Output<ov::Node> {
+      auto grouped_packed = StackConstantsRaw(packed);
+      auto grouped_scale = StackConstantsRaw(scale);
+      if (!grouped_packed || !grouped_scale) {
+        LITERT_LOG(LITERT_INFO,
+                   "[MoEChunk] rewrite[%s]: abort: split gate/up weights or "
+                   "scales are not uniform plain constants or not "
+                   "byte-aligned.",
+                   name.c_str());
+        return ov::Output<ov::Node>();
+      }
+      auto dequant = std::make_shared<ov::op::v0::Convert>(
+          grouped_packed, ref.w_up_dequant_type);
+      return std::make_shared<ov::op::v1::Multiply>(dequant, grouped_scale);
+    };
+
+    return {build_one(gate_packed, gate_scale), build_one(up_packed, up_scale)};
+  };
+
+  auto [stacked_gate, stacked_up] = stack_all_gate_up_weights();
+  if (!stacked_gate.get_node_shared_ptr() ||
+      !stacked_up.get_node_shared_ptr()) {
+    return false;
+  }
+  ov::Output<ov::Node> stacked_down = stack_all_down_weights();
+  if (!stacked_down.get_node_shared_ptr()) return false;
+
+  // Independent batched gate/up projections: MatMul([chunk,H],
+  // stacked_{gate,up}[N,half,H], transpose_b) each broadcast to
+  // [N,chunk,half] directly (no Squeeze needed -- unlike the single-token
+  // chunk's K-of-N gather, chunk is a real batch > 1).
+  //
+  // Explicitly Tile the hidden state to [N,chunk,H] instead of relying on
+  // MatMul's own implicit numpy broadcasting: NPUW's MoE Expert MatcherPass
+  // (src/plugins/intel_npu/src/plugin/npuw/partitioning/patterns/moe.cpp)
+  // requires a literal Tile node as the very first op of the isolated expert
+  // subgraph -- both to match the pattern at all, and as the anchor
+  // find_tile_and_extract_config() scans for when deriving the single-expert,
+  // chunk-iterative compiled variant. Tile's repeats rank (3) exceeding the
+  // hidden state's rank (2) causes the extra leading dims to be implicitly
+  // prepended with 1, so no explicit Unsqueeze is needed first.
+  auto tile_repeats = ov::op::v0::Constant::create(
+      ov::element::i64, ov::Shape{3}, {num_experts, int64_t{1}, int64_t{1}});
+  auto tiled_hidden = std::make_shared<ov::op::v0::Tile>(
+      ref.up_matmul->input_value(0), tile_repeats);
+  auto gate =
+      ref.up_matmul->clone_with_new_inputs({tiled_hidden, stacked_gate});
+  auto up_bcast =
+      ref.up_matmul->clone_with_new_inputs({tiled_hidden, stacked_up});
+
+  auto gate_act = std::make_shared<ov::op::v7::Gelu>(
+      gate, ov::op::GeluApproximationMode::TANH);
+  auto geglu = std::make_shared<ov::op::v1::Multiply>(gate_act, up_bcast);
+
+  // Batched down projection: [N,chunk,half] against stacked_down[N,H,half]
+  // (transpose_b) broadcasts directly to [N,chunk,H].
+  auto down_bcast =
+      ref.down_matmul->clone_with_new_inputs({geglu, stacked_down});
+
+  // Routing-weight matrix: scatter each token's renormalized top-K weights
+  // into an all-zero [chunk,N] background at its selected expert columns.
+  // chunk is read from ShapeOf so no static chunk size is ever assumed.
+  auto shape_of_idx = std::make_shared<ov::op::v3::ShapeOf>(layer.topk_indices,
+                                                            ov::element::i64);
+  auto chunk_dim_idx =
+      ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {0});
+  auto chunk_dim =
+      std::make_shared<ov::op::v8::Gather>(shape_of_idx, chunk_dim_idx, axis0);
+  auto num_experts_dim = ov::op::v0::Constant::create(
+      ov::element::i64, ov::Shape{1}, {num_experts});
+  auto base_shape = std::make_shared<ov::op::v0::Concat>(
+      ov::OutputVector{chunk_dim, num_experts_dim}, 0);
+  auto zero = ov::op::v0::Constant::create(
+      layer.router_weights.get_element_type(), ov::Shape{}, {0.0f});
+  auto base = std::make_shared<ov::op::v3::Broadcast>(zero, base_shape);
+  auto scatter_axis =
+      ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {1});
+  auto route = std::make_shared<ov::op::v12::ScatterElementsUpdate>(
+      base, layer.topk_indices, layer.router_weights, scatter_axis);
+
+  // Align the routing matrix with the [N,chunk,H] expert-output layout:
+  // [chunk,N] -> [N,chunk] -> [N,chunk,1].
+  auto transpose_perm =
+      ov::op::v0::Constant::create(ov::element::i64, ov::Shape{2}, {1, 0});
+  auto route_t = std::make_shared<ov::op::v1::Transpose>(route, transpose_perm);
+  auto unsq_axis =
+      ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {2});
+  auto route_b = std::make_shared<ov::op::v0::Unsqueeze>(route_t, unsq_axis);
+
+  auto weighted = std::make_shared<ov::op::v1::Multiply>(down_bcast, route_b);
+  auto reduce_axis =
+      ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {0});
+  auto summed =
+      std::make_shared<ov::op::v1::ReduceSum>(weighted, reduce_axis, false);
+
+  summed->set_friendly_name(final_add->get_friendly_name());
+  ov::copy_runtime_info(
+      final_add,
+      {gate, up_bcast, gate_act, geglu, down_bcast,
+       stacked_gate.get_node_shared_ptr(), stacked_up.get_node_shared_ptr(),
+       stacked_down.get_node_shared_ptr(), shape_of_idx, chunk_dim, base_shape,
+       base, route, route_t, route_b, weighted, summed});
+  ov::replace_node(final_add, summed);
+  LITERT_LOG(LITERT_DEBUG,
+             "[MoEChunk] rewrite[%s]: OK, replaced chain root '%s' with "
+             "multi-token chunked subgraph (N=%lld experts)",
+             name.c_str(), summed->get_friendly_name().c_str(),
+             static_cast<long long>(num_experts));
   return true;
 }
 
@@ -1082,26 +1417,29 @@ std::vector<MoELayer> FindMoeLayers(const std::shared_ptr<ov::Model>& model) {
     }
     layer.num_experts = layer.experts.size();
 
-    // Decode/generate only: the gather form assumes a single token. At this
-    // point (right after the TFLite frontend, before shape resolution) the
-    // batch dim may still be dynamic, so only reject when it is STATICALLY not
-    // 1 — matching NPUW's DeviceRoutedMoETransform guard. The concrete K used
-    // for the gather comes from the TopK 'k' constant, not from this shape.
+    // Classify by the router's token/chunk batch dim rather than rejecting
+    // non-single-token shapes outright: batch==1 (statically known) is a
+    // single-token/gather-shaped chunk, everything else (larger static
+    // batch, or symbolically dynamic) is a multi-token chunk handled by
+    // RegroupAndRewriteChunk. At this point (right after the TFLite
+    // frontend, before shape resolution) the batch dim may still be
+    // dynamic; only classify as a multi-token chunk when it is STATICALLY
+    // known to NOT be 1, matching NPUW's DeviceRoutedMoETransform guard for
+    // the gather path.
     const auto ishape = layer.topk_indices.get_partial_shape();
-    bool decode_ok = true;
-    if (ishape.rank().is_static() && ishape.rank().get_length() >= 1) {
-      if (ishape[0].is_static() && ishape[0].get_length() != 1) {
-        decode_ok = false;
-      }
+    layer.is_multi_token_chunk = false;
+    if (ishape.rank().is_static() && ishape.rank().get_length() >= 1 &&
+        ishape[0].is_static()) {
+      layer.is_multi_token_chunk = (ishape[0].get_length() != 1);
     }
     std::ostringstream shp;
     shp << ishape;
     LITERT_LOG(LITERT_DEBUG,
-               "[MoE] layer TopK='%s' K=%lld experts=%zu indices=%s%s",
+               "[MoE] layer TopK='%s' K=%lld experts=%zu indices=%s [%s]",
                layer.topk->get_friendly_name().c_str(),
                static_cast<long long>(layer.k), layer.experts.size(),
-               shp.str().c_str(), decode_ok ? "" : " [skip: batch != 1]");
-    if (!decode_ok) continue;
+               shp.str().c_str(),
+               layer.is_multi_token_chunk ? "multi-token" : "single-token");
 
     std::sort(layer.experts.begin(), layer.experts.end(),
               [](const ExpertBranch& a, const ExpertBranch& b) {
@@ -1118,20 +1456,99 @@ std::vector<MoELayer> FindMoeLayers(const std::shared_ptr<ov::Model>& model) {
 
 }  // namespace
 
+std::optional<bool> DetectMoeIsMultiTokenChunk(
+    const std::shared_ptr<ov::Model>& model) {
+  auto layers = FindMoeLayers(model);
+  if (layers.empty()) return std::nullopt;
+  const bool first = layers.front().is_multi_token_chunk;
+  for (const auto& layer : layers) {
+    if (layer.is_multi_token_chunk != first) {
+      LITERT_LOG(LITERT_WARNING,
+                 "[MoE] layers disagree on single-token-vs-multi-token chunk "
+                 "shape (e.g. '%s' vs '%s'); treating as single-token chunk",
+                 layers.front().topk->get_friendly_name().c_str(),
+                 layer.topk->get_friendly_name().c_str());
+      return false;
+    }
+  }
+  return first;
+}
+
 bool MoEGatherRewrite::run_on_model(const std::shared_ptr<ov::Model>& model) {
   // 1. Find all TopK nodes that look like MoE routers.
   auto layers = FindMoeLayers(model);
   LITERT_LOG(LITERT_INFO, "[MoEGather] discovered %zu candidate MoE layer(s)",
              layers.size());
 
-  // 2. For each candidate, attempt to rewrite it into gather-K form.
+  // 2. For each candidate, dispatch to the strategy matching its router's
+  // token/chunk batch shape and attempt to rewrite it.
   bool changed = false;
   for (auto& layer : layers) {
-    if (RegroupAndRewrite(layer)) {
-      changed = true;
-    }
+    const bool ok = layer.is_multi_token_chunk ? RegroupAndRewriteChunk(layer)
+                                               : RegroupAndRewrite(layer);
+    if (ok) changed = true;
   }
 
+  return changed;
+}
+
+SplitSharedConstants::SplitSharedConstants() {}
+
+bool SplitSharedConstants::run_on_model(
+    const std::shared_ptr<ov::Model>& model) {
+  bool changed = false;
+  size_t split = 0, constants_touched = 0;
+  // get_ops() (unordered) instead of get_ordered_ops(): this pass only looks
+  // at each Constant in isolation (its own shape/name/consumers), never
+  // relies on topological order, so there's no reason to pay for the full
+  // topological sort get_ordered_ops() does over a model that can have
+  // hundreds of thousands of nodes.
+  const auto all_ops = model->get_ops();
+  LITERT_LOG(LITERT_INFO, "SplitSharedConstants: scanning %zu node(s)",
+             all_ops.size());
+  for (const auto& node : all_ops) {
+    auto cnst = std::dynamic_pointer_cast<ov::op::v0::Constant>(node);
+    if (!cnst) continue;
+
+    if (ov::shape_size(cnst->get_shape()) != 256 &&
+        ov::shape_size(cnst->get_shape()) != 512) {
+      continue;
+    }
+
+    // Constant has exactly one output. get_target_inputs() returns a
+    // std::set<Input<Node>> BY VALUE -- capture it in a named local so
+    // begin()/end() below refer to the SAME set instance (calling
+    // get_target_inputs() twice would construct two independent temporary
+    // sets and mix iterators from different containers, which is undefined
+    // behavior and can manifest as an effectively infinite loop).
+    auto out = cnst->output(0);
+    const auto target_inputs = out.get_target_inputs();
+    std::vector<ov::Input<ov::Node>> consumers(target_inputs.begin(),
+                                               target_inputs.end());
+    if (consumers.size() <= 1) continue;
+
+    // Leave the first consumer on the original node; give every other
+    // consumer its own independent copy.
+    for (size_t i = 1; i < consumers.size(); ++i) {
+      auto clone = std::make_shared<ov::op::v0::Constant>(
+          cnst->get_element_type(), cnst->get_shape(), cnst->get_data_ptr());
+      clone->set_friendly_name(cnst->get_friendly_name() + "_split" +
+                               std::to_string(i));
+      ov::copy_runtime_info(cnst, clone);
+      consumers[i].replace_source_output(clone->output(0));
+      ++split;
+      // log the output name LITERT_LOG
+      LITERT_LOG(LITERT_INFO,
+                 "SplitSharedConstants: created clone %s for consumer %zu",
+                 clone->get_friendly_name().c_str(), i);
+    }
+    ++constants_touched;
+    changed = true;
+  }
+  LITERT_LOG(LITERT_INFO,
+             "SplitSharedConstants: split %zu consumer(s) off %zu shared "
+             "constant(s) into independent copies",
+             split, constants_touched);
   return changed;
 }
 
@@ -1154,6 +1571,18 @@ void NpuOptimizer::Run(const std::shared_ptr<ov::Model>& model) const {
   if (enable_moe_gather_) {
     pass_manager.register_pass<MoEGatherRewrite>();
   }
+  // Last: give every consumer of an accidentally-shared Constant its own
+  // copy. Deliberately runs AFTER MoEGatherRewrite (when enabled) instead of
+  // first: before that rewrite runs, the graph still has every MoE expert
+  // densely expanded (up to num_experts x num_layers branches), so scanning
+  // it here would be scanning a graph orders of magnitude bigger than
+  // necessary for a fix that targets attention/norm constants entirely
+  // outside the MoE expert region. Running last means this always scans the
+  // final, already-shrunk graph.
+  if (split_shared_constants_) {
+    pass_manager.register_pass<SplitSharedConstants>();
+  }
+
   pass_manager.run_passes(model);
 }
 
