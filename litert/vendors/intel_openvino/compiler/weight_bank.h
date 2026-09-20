@@ -21,6 +21,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 #include "absl/types/span.h"  // from @com_google_absl
 #include "litert/compiler/cc/litert_model.h"
@@ -57,7 +58,10 @@ class WeightBank {
 
   // BufferId of the weight tensor named |tensor_name|, or nullopt if unknown.
   // Used to build the GlobalGraph const_map (OV weight -> shared buffer id).
-  // Valid any time after AddSubgraph().
+  // Real weights resolve as soon as AddSubgraph() has run; derived/generated
+  // ones (registered under their source_key, which HarvestSharedConstants
+  // requires to equal the constant's friendly_name) only resolve after
+  // FinalizeDerivedBuffers().
   std::optional<int32_t> BufferIdOfName(std::string_view tensor_name) const;
 
   // The deduplicated buffer pool as (BufferId -> bytes view), for populating
@@ -67,13 +71,38 @@ class WeightBank {
     return buffer_bytes_;
   }
 
+  // Registers a generated/derived constant's bytes under |key| (dedup: only
+  // the first registration for a given key is kept). Its BufferId isn't
+  // assigned until FinalizeDerivedBuffers() -- resolve it later via
+  // BufferIdOfName(key).
+  void RegisterGeneratedConstant(std::string_view key,
+                                 std::vector<uint8_t> bytes);
+
+  // Assigns final BufferIds (starting after the highest real id) to every
+  // distinct key seen via RegisterGeneratedConstant. Must be called exactly
+  // once, after every partition's AddSubgraph/HarvestSharedConstants has run
+  // -- only then is the real-BufferId space (and hence a collision-free
+  // starting point for derived ids) fully known.
+  void FinalizeDerivedBuffers();
+
  private:
   // BufferId -> the buffer's bytes (a view into the model's mmapped weights).
   std::unordered_map<int32_t, absl::Span<const uint8_t>> buffer_bytes_;
   // Weight tensor name -> its BufferId. Many names may map to one BufferId
   // (tensors that share storage), which is how shared weights resolve to a
-  // single pool buffer.
+  // single pool buffer. Also holds derived/generated keys once
+  // FinalizeDerivedBuffers() assigns their BufferIds (key == friendly_name,
+  // enforced by HarvestSharedConstants).
   std::unordered_map<std::string, int32_t> name_to_buffer_id_;
+  // Owns derived buffers' bytes (moving/growing this vector does not
+  // invalidate previously-handed-out spans: growth move-constructs the
+  // std::vector<uint8_t> elements, which only transfers their internal
+  // pointer, never reallocates the underlying heap buffer).
+  std::vector<std::vector<uint8_t>> derived_storage_;
+  // Generated-constant key -> its bytes, staged until FinalizeDerivedBuffers()
+  // assigns final BufferIds.
+  std::unordered_map<std::string, std::vector<uint8_t>> pending_derived_bytes_;
+  bool derived_finalized_ = false;
 };
 
 }  // namespace litert::openvino

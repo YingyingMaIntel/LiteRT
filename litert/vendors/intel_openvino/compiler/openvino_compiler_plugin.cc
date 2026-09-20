@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -19,6 +20,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <ostream>
 #include <streambuf>
 #include <string>
@@ -26,14 +28,8 @@
 #include <utility>
 #include <vector>
 
-#include "openvino/core/any.hpp"
-#include "openvino/core/except.hpp"
-#include "openvino/frontend/tensorflow_lite/frontend.hpp"
-#include "openvino/frontend/tensorflow_lite/graph_iterator.hpp"
-#include "openvino/openvino.hpp"
-#include "openvino/runtime/core.hpp"
 #include "absl/strings/str_format.h"  // from @com_google_absl
-#include "absl/types/span.h"  // from @com_google_absl
+#include "absl/types/span.h"          // from @com_google_absl
 #include "litert/c/internal/litert_logging.h"
 #include "litert/c/internal/litert_logging_helper_with_compiler_context.h"
 #include "litert/c/litert_common.h"
@@ -58,6 +54,12 @@
 #include "litert/vendors/intel_openvino/compiler/openvino_soc_config.h"
 #include "litert/vendors/intel_openvino/compiler/weight_bank.h"
 #include "litert/vendors/intel_openvino/compiler/weights_to_parameters.h"
+#include "openvino/core/any.hpp"
+#include "openvino/core/except.hpp"
+#include "openvino/frontend/tensorflow_lite/frontend.hpp"
+#include "openvino/frontend/tensorflow_lite/graph_iterator.hpp"
+#include "openvino/openvino.hpp"
+#include "openvino/runtime/core.hpp"
 
 namespace {
 
@@ -555,30 +557,25 @@ LiteRtStatus LiteRtCompilerPluginCompile(
     // the SAME ascending-id order Serialize() lays out, so a Constant's WLCA
     // bin_offset equals its position in the temp file staged at dispatch.
     std::map<int32_t, size_t> pool_offset_of;
-    if (share_weights) {
-      for (int p = 0; p < num_partitions; ++p) {
-        auto subgraph = model.Subgraph(p);
-        if (subgraph.HasValue()) weight_bank.AddSubgraph(subgraph.Value());
-      }
-      LITERT_LOG(LITERT_INFO, "Weight sharing (%s): %zu buffers, %zu bytes",
-                 share_device.c_str(), weight_bank.NumBuffers(),
-                 weight_bank.TotalBytes());
-      // Populate the GlobalGraph shared buffer pool. Use an ordered map keyed
-      // by BufferId so the pool is laid out in ascending id order (matching
-      // Serialize()), then assign each buffer its pool offset. The bytes are
-      // BORROWED from the WeightBank (views into the model's mmapped weights,
-      // which outlive this whole Compile call) -- no copy of the multi-GB pool.
-      std::map<uint32_t, absl::Span<const uint8_t>> ordered(
-          weight_bank.Buffers().begin(), weight_bank.Buffers().end());
-      size_t running_offset = 0;
-      for (const auto& [buffer_id, bytes] : ordered) {
-        global_graph.buffers.push_back({buffer_id, running_offset, bytes});
-        pool_offset_of[static_cast<int32_t>(buffer_id)] = running_offset;
-        running_offset += bytes.size();
-      }
-    }
 
+    // Phase 1: convert every partition to OpenVINO, run NPU-specific graph
+    // optimizations and harvest shared-buffer identity (HarvestSharedConstants)
+    // -- ALL before the shared pool is assembled below. This must happen first
+    // because a WLCA bin_offset, once assigned to a buffer and baked into some
+    // partition's exported blob, can never move or be dropped later -- so
+    // whether a per-expert weight buffer is still needed standalone (a
+    // partition's rewrite failed and it still references the original Constant)
+    // or has been fully replaced by a stacked constant in every partition that
+    // touches it, must be known BEFORE we decide the pool's final contents and
+    // offsets.
     ov::Core core;
+    std::vector<litert::openvino::OpenVinoCompileContext> contexts;
+    std::vector<std::shared_ptr<ov::Model>> ov_models;
+    std::vector<std::string> graph_names_vec;
+    contexts.reserve(num_partitions);
+    ov_models.reserve(num_partitions);
+    graph_names_vec.reserve(num_partitions);
+
     for (int partition_idx = 0; partition_idx < num_partitions;
          ++partition_idx) {
       // Build a per-partition compile context.  This honours any per-graph
@@ -588,104 +585,136 @@ LiteRtStatus LiteRtCompilerPluginCompile(
           litert::openvino::OpenVinoCompileContext::Create(
               compiler_plugin->GetIntelOpenVinoOptions(), partition_idx));
       LITERT_RETURN_IF_ERROR(context.ConfigureForSoc(soc_model));
-      if (share_npu) {
-        // NPU shared path: turn on NPUW/CWAI so export_model emits a weightless
-        // blob whose constants are referenced by WeightlessCacheAttribute
-        // bin_offset instead of baked in.
-        context.ConfigureForNpuWeightSharing();
-      }
 
       auto graph_name = absl::StrFormat("Partition_%d", partition_idx);
       litert::Expected<litert::compiler::Subgraph> expected_subgraph =
           model.Subgraph(partition_idx);
-      if (expected_subgraph.HasValue()) {
-        std::shared_ptr<ov::frontend::tensorflow_lite::GraphIterator>
-            graph_delegate =
-                std::make_shared<litert::openvino::GraphIteratorDelegate>(
-                    compiler_plugin->ctx(), &expected_subgraph.Value(),
-                    context.Device());
-        auto input_model = tflite_fe->load(graph_delegate);
-        LITERT_LOG(LITERT_INFO, "Model loaded");
-        auto ov_model = tflite_fe->convert(input_model);
-
-        // Run NPU-specific optimization passes.
-        context.OptimizeModel(ov_model);
-
-        ov::AnyMap configs = context.ConfigsMap();
-        std::map<std::string, uint32_t> const_map;
-        if (share_weights) {
-          if (share_npu) {
-            // NPU: alias+tag weights (see AliasAndTagSharedConstants).
-            litert::openvino::AliasAndTagSharedConstants(
-                ov_model, weight_bank, pool_offset_of, partition_idx);
-          } else {
-            // GPU: convert weights to Parameters bound to the shared bank at
-            // dispatch; const_map records friendly_name -> BufferId.
-            const size_t converted =
-                litert::openvino::ConvertWeightsToParameters(
-                    ov_model, weight_bank, &const_map);
-            LITERT_LOG(LITERT_INFO,
-                       "Weight sharing (GPU): converted %zu weights to "
-                       "parameters in partition %d",
-                       converted, partition_idx);
-          }
-        }
-
-        // Compile using the per-partition device and properties.
-        LITERT_LOG(LITERT_INFO, "Compiling partition %d for device %s",
-                   partition_idx, context.Device().c_str());
-        auto compiled_model =
-            core.compile_model(ov_model, context.Device(), configs);
-
-        CustomOStreamBuf obuf;
-        std::ostream oss(&obuf);
-        compiled_model.export_model(oss);
-        LITERT_LOG(LITERT_INFO, "Model export done");
-
-        // Resolve the graph type enum corresponding to context.Device() so
-        // the dispatcher can import on the same device.  We translate the
-        // string back to the enum to avoid duplicating the resolution logic.
-        LiteRtIntelOpenVinoGraphBackend graph_backend_enum =
-            kLiteRtIntelOpenVinoGraphBackendNPU;
-        const std::string& dev = context.Device();
-        if (dev == "CPU")
-          graph_backend_enum = kLiteRtIntelOpenVinoGraphBackendCPU;
-        else if (dev == "GPU")
-          graph_backend_enum = kLiteRtIntelOpenVinoGraphBackendGPU;
-
-        if (share_weights) {
-          // Aggregate this partition into the GlobalGraph container instead of
-          // emitting standalone per-partition bytecode. The device-headered
-          // payload becomes this subgraph's payload; the whole container is
-          // serialized once after the loop and returned for every partition
-          // index.
-          // Park the export payload in the graph's owning store so the
-          // subgraph's payload span stays valid until Serialize(). A deque, so
-          // this emplace never invalidates earlier partitions' payload spans.
-          global_graph.payload_store.push_back(
-              litert::openvino::MakeBytecodeHeader(graph_backend_enum) +
-              obuf.drain_str());
-          const std::string& held = global_graph.payload_store.back();
-          litert::openvino::OpenVinoGlobalGraph::Subgraph subgraph;
-          subgraph.name = graph_name;
-          subgraph.device = static_cast<uint8_t>(graph_backend_enum);
-          subgraph.const_map = std::move(const_map);
-          subgraph.payload = absl::MakeConstSpan(
-              reinterpret_cast<const uint8_t*>(held.data()), held.size());
-          global_graph.subgraphs.emplace(graph_name, std::move(subgraph));
-        } else {
-          // Non-shared path: standalone per-partition bytecode (device header +
-          // baked-weights payload).
-          result->byte_code[partition_idx] =
-              litert::openvino::MakeBytecodeHeader(graph_backend_enum) +
-              obuf.drain_str();
-        }
-
-        result->graph_names[partition_idx] = graph_name;
-      } else {
+      if (!expected_subgraph.HasValue()) {
         LITERT_LOG(LITERT_INFO, "Failed to retrieve Subgraph");
         return kLiteRtStatusErrorCompilation;
       }
+      if (share_weights) weight_bank.AddSubgraph(expected_subgraph.Value());
+
+      std::shared_ptr<ov::frontend::tensorflow_lite::GraphIterator>
+          graph_delegate =
+              std::make_shared<litert::openvino::GraphIteratorDelegate>(
+                  compiler_plugin->ctx(), &expected_subgraph.Value(),
+                  context.Device());
+      auto input_model = tflite_fe->load(graph_delegate);
+      LITERT_LOG(LITERT_INFO, "Model loaded");
+      auto ov_model = tflite_fe->convert(input_model);
+
+      if (share_npu) {
+        context.ConfigureForNpuWeightSharing();
+      }
+
+      context.OptimizeModel(ov_model);
+      if (share_npu) {
+        // Resolve and stamp pool identity for every sharing-candidate
+        // Constant now that optimization (incl. MoE expert-weight stacking)
+        // has finished rewriting the graph -- see HarvestSharedConstants.
+        litert::openvino::HarvestSharedConstants(ov_model, weight_bank);
+      }
+
+      ov_models.push_back(ov_model);
+      graph_names_vec.push_back(graph_name);
+      contexts.push_back(std::move(context));
+    }
+
+    if (share_weights) {
+      LITERT_LOG(LITERT_INFO, "Weight sharing (%s): building shared pool",
+                 share_device.c_str());
+
+      // Assembles the final pool: ascending BufferId order (the layout
+      // Serialize() requires), pruning buffers no partition references
+      // anymore on the NPU path (see BuildPool).
+      const litert::openvino::PoolLayout layout =
+          litert::openvino::BuildPool(ov_models, weight_bank, share_npu);
+      pool_offset_of = layout.pool_offset_of;
+      global_graph.buffers.reserve(layout.buffers.size());
+      for (const auto& entry : layout.buffers) {
+        global_graph.buffers.push_back({static_cast<uint32_t>(entry.buffer_id),
+                                        entry.pool_offset, entry.bytes});
+      }
+    }
+
+    // Phase 2: alias/convert weights against the now-final pool, then compile
+    // and export each partition.
+    for (int partition_idx = 0; partition_idx < num_partitions;
+         ++partition_idx) {
+      auto& context = contexts[partition_idx];
+      auto& ov_model = ov_models[partition_idx];
+      const auto& graph_name = graph_names_vec[partition_idx];
+
+      ov::AnyMap configs = context.ConfigsMap();
+      std::map<std::string, uint32_t> const_map;
+      if (share_weights) {
+        if (share_npu) {
+          // NPU: alias+tag weights (see AliasAndTagSharedConstants).
+          litert::openvino::AliasAndTagSharedConstants(
+              ov_model, weight_bank, pool_offset_of, partition_idx);
+        } else {
+          // GPU: convert weights to Parameters bound to the shared bank at
+          // dispatch; const_map records friendly_name -> BufferId.
+          const size_t converted = litert::openvino::ConvertWeightsToParameters(
+              ov_model, weight_bank, &const_map);
+          LITERT_LOG(LITERT_INFO,
+                     "Weight sharing (GPU): converted %zu weights to "
+                     "parameters in partition %d",
+                     converted, partition_idx);
+        }
+      }
+      // Compile using the per-partition device and properties.
+      LITERT_LOG(LITERT_INFO, "Compiling partition %d for device %s",
+                 partition_idx, context.Device().c_str());
+      auto compiled_model =
+          core.compile_model(ov_model, context.Device(), configs);
+
+      CustomOStreamBuf obuf;
+      std::ostream oss(&obuf);
+      compiled_model.export_model(oss);
+      LITERT_LOG(LITERT_INFO, "Model export done");
+
+      // Resolve the graph type enum corresponding to context.Device() so
+      // the dispatcher can import on the same device.  We translate the
+      // string back to the enum to avoid duplicating the resolution logic.
+      LiteRtIntelOpenVinoGraphBackend graph_backend_enum =
+          kLiteRtIntelOpenVinoGraphBackendNPU;
+      const std::string& dev = context.Device();
+      if (dev == "CPU")
+        graph_backend_enum = kLiteRtIntelOpenVinoGraphBackendCPU;
+      else if (dev == "GPU")
+        graph_backend_enum = kLiteRtIntelOpenVinoGraphBackendGPU;
+
+      if (share_weights) {
+        // Aggregate this partition into the GlobalGraph container instead of
+        // emitting standalone per-partition bytecode. The device-headered
+        // payload becomes this subgraph's payload; the whole container is
+        // serialized once after the loop and returned for every partition
+        // index.
+        // Park the export payload in the graph's owning store so the
+        // subgraph's payload span stays valid until Serialize(). A deque, so
+        // this emplace never invalidates earlier partitions' payload spans.
+        global_graph.payload_store.push_back(
+            litert::openvino::MakeBytecodeHeader(graph_backend_enum) +
+            obuf.drain_str());
+        const std::string& held = global_graph.payload_store.back();
+        litert::openvino::OpenVinoGlobalGraph::Subgraph subgraph;
+        subgraph.name = graph_name;
+        subgraph.device = static_cast<uint8_t>(graph_backend_enum);
+        subgraph.const_map = std::move(const_map);
+        subgraph.payload = absl::MakeConstSpan(
+            reinterpret_cast<const uint8_t*>(held.data()), held.size());
+        global_graph.subgraphs.emplace(graph_name, std::move(subgraph));
+      } else {
+        // Non-shared path: standalone per-partition bytecode (device header +
+        // baked-weights payload).
+        result->byte_code[partition_idx] =
+            litert::openvino::MakeBytecodeHeader(graph_backend_enum) +
+            obuf.drain_str();
+      }
+
+      result->graph_names[partition_idx] = graph_name;
     }
     if (share_weights) {
       // Serialize the whole GlobalGraph ONCE into byte_code[0] and point every

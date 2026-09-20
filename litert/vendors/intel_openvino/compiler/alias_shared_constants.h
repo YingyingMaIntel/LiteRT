@@ -20,11 +20,35 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <vector>
 
-#include "openvino/core/model.hpp"
+#include "absl/types/span.h"
 #include "litert/vendors/intel_openvino/compiler/weight_bank.h"
+#include "openvino/core/model.hpp"
 
 namespace litert::openvino {
+
+// One buffer's placement in the assembled cross-partition pool.
+struct PoolEntry {
+  int32_t buffer_id = 0;
+  size_t pool_offset = 0;  // byte offset within the contiguous pool
+  absl::Span<const uint8_t> bytes;
+};
+
+struct PoolLayout {
+  std::vector<PoolEntry> buffers;
+  std::map<int32_t, size_t> pool_offset_of;
+};
+
+// Assembles the shared buffer pool. Finalizes (assigns and stamps) derived/
+// generated buffer ids as its first step -- see
+// WeightBank::FinalizeDerivedBuffers -- so must be called exactly once, after
+// every partition's AddSubgraph/HarvestSharedConstants has completed.
+PoolLayout BuildPool(const std::vector<std::shared_ptr<ov::Model>>& ov_models,
+                     WeightBank& weight_bank, bool prune_dead);
+
+void HarvestSharedConstants(const std::shared_ptr<ov::Model>& ov_model,
+                            WeightBank& weight_bank);
 
 // NPU cross-partition weight-sharing transform (counterpart to the GPU
 // ConvertWeightsToParameters).
